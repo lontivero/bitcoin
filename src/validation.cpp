@@ -5571,8 +5571,9 @@ bool DumpMempool(const CTxMemPool& pool)
 {
     int64_t start = GetTimeMicros();
 
+    std::map<uint256, CAmount> mapDeltas;
+    std::map<uint256, double> priority_deltas;
     std::vector<TxMempoolInfo> vinfo;
-    std::map<uint256, std::pair<double, CAmount>> mapDeltas;
     std::set<uint256> unbroadcast_txids;
 
     static Mutex dump_mutex;
@@ -5580,7 +5581,14 @@ bool DumpMempool(const CTxMemPool& pool)
 
     {
         LOCK(pool.cs);
-        mapDeltas = pool.mapDeltas;
+        for (const auto &i : pool.mapDeltas) {
+            if (i.second.first) {   // priority delta
+                priority_deltas[i.first] = i.second.first;
+            }
+            if (i.second.second) {  // fee delta
+                mapDeltas[i.first] = i.second.second;
+            }
+        }
         vinfo = pool.infoAll();
         unbroadcast_txids = pool.GetUnbroadcastTxs();
     }
@@ -5588,26 +5596,6 @@ bool DumpMempool(const CTxMemPool& pool)
     int64_t mid = GetTimeMicros();
 
     try {
-        std::map<std::string, std::vector<unsigned char>> mapData;
-        mapData["deltas"] = SerializeToVector(mapDeltas);
-        {
-            std::vector<std::map<std::string, std::vector<unsigned char>>> txMapDatas;
-            for (TxMempoolInfo info : vinfo) {
-                std::map<std::string, std::vector<unsigned char>> mapTxData;
-                mapTxData[""] = SerializeToVector(*(info.tx));
-                mapTxData["t"] = SerializeToVector(count_seconds(info.m_time));
-                txMapDatas.push_back(std::move(mapTxData));
-            }
-
-            mapData["txs"] = SerializeToVector(txMapDatas);
-        }
-        mapData["unbroadcast_txids"] = SerializeToVector(unbroadcast_txids);
-        {
-            CDataStream ss(SER_DISK, CLIENT_VERSION);
-            pool.DumpMinFeeInternal(ss);
-            mapData["minfee"] = std::vector<unsigned char>(ss.begin(), ss.end());
-        }
-
         FILE* filestr = fsbridge::fopen(GetDataDir() / "mempool.dat.new", "wb");
         if (!filestr) {
             return false;
@@ -5615,14 +5603,44 @@ bool DumpMempool(const CTxMemPool& pool)
 
         CAutoFile file(filestr, SER_DISK, CLIENT_VERSION);
 
-        uint64_t version = MEMPOOL_DUMP_VERSION_KNOTS_014;
+        uint64_t version = MEMPOOL_DUMP_VERSION_CORE;
         file << version;
 
-        file << mapData;
+        file << (uint64_t)vinfo.size();
+        for (const auto& i : vinfo) {
+            file << *(i.tx);
+            file << int64_t{count_seconds(i.m_time)};
+            file << int64_t{i.nFeeDelta};
+            mapDeltas.erase(i.tx->GetHash());
+        }
+
+        file << mapDeltas;
+
+        LogPrintf("Writing %d unbroadcast transactions to disk.\n", unbroadcast_txids.size());
+        file << unbroadcast_txids;
 
         if (!FileCommit(file.Get()))
             throw std::runtime_error("FileCommit failed");
         file.fclose();
+
+        const auto knots_filepath = GetDataDir() / "mempool-knots.dat";
+        if (priority_deltas.size()) {
+            auto knots_tmppath = knots_filepath;
+            knots_tmppath += ".new";
+            CAutoFile file(fsbridge::fopen(knots_tmppath, "wb"), SER_DISK, CLIENT_VERSION);
+
+            uint64_t version = MEMPOOL_KNOTS_DUMP_VERSION;
+            file << version;
+
+            file << priority_deltas;
+
+            if (!FileCommit(file.Get())) throw std::runtime_error("FileCommit failed");
+            file.fclose();
+            RenameOver(knots_tmppath, knots_filepath);
+        } else {
+            fs::remove(knots_filepath);
+        }
+
         RenameOver(GetDataDir() / "mempool.dat.new", GetDataDir() / "mempool.dat");
         int64_t last = GetTimeMicros();
         LogPrintf("Dumped mempool: %gs to copy, %gs to dump\n", (mid-start)*MICRO, (last-mid)*MICRO);
